@@ -52,6 +52,8 @@ You can also depend on it from another project via a git URL in `package.json`:
 import { VoipClient } from "baileys-caller";
 
 const client = new VoipClient({ authDir: "./auth" });
+// You can also pass an existing Baileys session directory directly:
+// const client = new VoipClient("./session");
 
 await client.connect(); // first run prints a QR for WhatsApp > Linked Devices
 
@@ -80,11 +82,13 @@ npx tsx examples/call.mts ./auth 12345678901 ./hello.mp3
 
 | Option    | Type     | Description                                |
 |-----------|----------|--------------------------------------------|
-| `authDir` | `string` | Baileys multi-file auth state directory    |
+| `authDir` | `string?` | Baileys multi-file auth state directory. When omitted, env vars and common session folders are auto-detected before falling back to `./auth`. |
+| `sessionDir` | `string?` | Alias for `authDir`, useful when reusing an existing bot session folder. |
+| `autoDetectAuthDir` | `boolean?` | Enables common-folder auto-detection when no directory is provided (default: `true`). |
 
 ### `client.connect(): Promise<void>`
 
-Connects to WhatsApp. On first run a QR code is printed; scan it from `WhatsApp > Settings > Linked Devices`. Subsequent runs reuse `authDir`.
+Connects to WhatsApp. On first run a QR code is printed; scan it from `WhatsApp > Settings > Linked Devices`. Subsequent runs reuse `authDir`, `sessionDir`, a directory from `BAILEYS_AUTH_DIR` / `BAILEYS_SESSION_DIR` / `WHATSAPP_AUTH_DIR`, or an auto-detected local folder containing `creds.json` (`./auth`, `./session`, `./sessions`, `./baileys_auth_info`, `./auth_info_baileys`, `./database/baileys`). If none exists, it falls back to `./auth`.
 
 ### `client.call(phoneNumber, opts?): Promise<ActiveCall>`
 
@@ -133,7 +137,7 @@ Returned by `client.call()`. Extends `EventEmitter`.
 
 ## Auth state
 
-`authDir` stores Baileys session keys after the first QR scan. Treat it like a credential — anyone with that directory can act as your linked device.
+`authDir` / `sessionDir` stores Baileys session keys after the first QR scan. Treat it like a credential — anyone with that directory can act as your linked device. If you already have a Baileys bot session, pass its multi-file auth directory (the folder that contains `creds.json`) to reuse it without scanning a second QR.
 
 ## WASM resources
 
