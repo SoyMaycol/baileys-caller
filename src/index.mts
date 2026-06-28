@@ -12,7 +12,8 @@
  */
 import { EventEmitter } from "node:events";
 import { randomBytes, createHmac } from "node:crypto";
-import { resolve } from "node:path";
+import { existsSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
 
 import { WasmEngine } from "./wasm-engine.mjs";
 import { RelayRtcTransport, type RelayListUpdatePayload } from "./relay-transport.mjs";
@@ -24,6 +25,16 @@ export type { VoipSdkConfig, CallOptions, CallEvents, AudioConfig } from "./type
 export { CallState } from "./types.mjs";
 
 const SHA256_LEN = 32;
+const DEFAULT_AUTH_DIR = "./auth";
+const AUTH_DIR_ENV_KEYS = ["BAILEYS_AUTH_DIR", "BAILEYS_SESSION_DIR", "WHATSAPP_AUTH_DIR"] as const;
+const AUTH_DIR_CANDIDATES = [
+  DEFAULT_AUTH_DIR,
+  "./session",
+  "./sessions",
+  "./baileys_auth_info",
+  "./auth_info_baileys",
+  "./database/baileys",
+] as const;
 
 const loadBaileys = async (): Promise<any> => {
   try {
@@ -70,6 +81,54 @@ const computeHmacSha256 = (data: Uint8Array, key: Uint8Array): Uint8Array => {
   return new Uint8Array(result.buffer, result.byteOffset, result.byteLength);
 };
 
+const isExistingBaileysAuthDir = (authDir: string): boolean => {
+  try {
+    return statSync(authDir).isDirectory() && existsSync(join(authDir, "creds.json"));
+  } catch {
+    return false;
+  }
+};
+
+const firstConfiguredAuthDir = (): string | undefined => {
+  for (const key of AUTH_DIR_ENV_KEYS) {
+    const value = process.env[key];
+    if (value?.trim()) return value;
+  }
+  return undefined;
+};
+
+const normalizeAuthDir = (config: VoipSdkConfig | string): string => {
+  if (typeof config === "string") {
+    if (config.trim().length === 0) {
+      throw new TypeError("VoipClient authDir must be a non-empty string when provided.");
+    }
+    return config;
+  }
+
+  const { authDir, sessionDir, autoDetectAuthDir = true } = config;
+  if (authDir !== undefined && sessionDir !== undefined && authDir !== sessionDir) {
+    throw new TypeError("VoipClient received both authDir and sessionDir with different values.");
+  }
+
+  const explicitAuthDir = authDir ?? sessionDir;
+  if (explicitAuthDir !== undefined) {
+    if (typeof explicitAuthDir !== "string" || explicitAuthDir.trim().length === 0) {
+      throw new TypeError("VoipClient authDir must be a non-empty string when provided.");
+    }
+    return explicitAuthDir;
+  }
+
+  const envAuthDir = firstConfiguredAuthDir();
+  if (envAuthDir) return envAuthDir;
+
+  if (autoDetectAuthDir) {
+    const detectedAuthDir = AUTH_DIR_CANDIDATES.find(isExistingBaileysAuthDir);
+    if (detectedAuthDir) return detectedAuthDir;
+  }
+
+  return DEFAULT_AUTH_DIR;
+};
+
 const isCallReceiptNode = (node: any): boolean => {
   if (node?.tag !== "receipt") return false;
   const child = Array.isArray(node.content) ? node.content[0] : null;
@@ -82,6 +141,7 @@ export class ActiveCall extends EventEmitter {
   #endResolver!: (reason: string) => void;
   readonly #endPromise: Promise<string>;
   #endTimer: NodeJS.Timeout | null = null;
+  #ending = false;
   #ended = false;
 
   /** @internal mirrors the source path for the audio feeder */
@@ -95,17 +155,19 @@ export class ActiveCall extends EventEmitter {
     super();
     this.#endPromise = new Promise((res) => { this.#endResolver = res; });
     if (durationMs > 0) {
-      this.#endTimer = setTimeout(() => this.end(), durationMs);
+      this.#endTimer = setTimeout(() => this.end("timeout"), durationMs);
     }
   }
 
   get state(): CallState { return this.#state; }
 
-  end = (): void => {
+  end = (reason = "hangup"): void => {
     if (this.#ended) return;
-    this.#ended = true;
-    if (this.#endTimer) { clearTimeout(this.#endTimer); this.#endTimer = null; }
-    try { this.engine.endCall(0, true); } catch {}
+    if (!this.#ending) {
+      this.#ending = true;
+      try { this.engine.endCall(0, true); } catch {}
+    }
+    this._forceEnd(reason);
   };
 
   mute = (muted: boolean): void => {
@@ -131,6 +193,7 @@ export class ActiveCall extends EventEmitter {
   _forceEnd = (reason: string): void => {
     if (this.#ended) return;
     this.#ended = true;
+    this.#ending = false;
     if (this.#endTimer) { clearTimeout(this.#endTimer); this.#endTimer = null; }
     this.emit("ended", reason);
     this.#endResolver(reason);
@@ -139,7 +202,7 @@ export class ActiveCall extends EventEmitter {
 
 /** Top-level client. Connects to WhatsApp and lets you place calls. */
 export class VoipClient {
-  readonly #config: VoipSdkConfig;
+  readonly #config: VoipSdkConfig & { authDir: string };
   #engine: WasmEngine | null = null;
   #relay: RelayRtcTransport | null = null;
   #signaling: SignalingBridge | null = null;
@@ -155,9 +218,26 @@ export class VoipClient {
   #captureFramesPerChunk = 320;
   #feeder: AudioFeeder | null = null;
 
-  constructor(config: VoipSdkConfig) {
-    this.#config = config;
+  constructor(config: VoipSdkConfig | string = {}) {
+    this.#config = {
+      ...(typeof config === "string" ? {} : config),
+      authDir: normalizeAuthDir(config),
+    };
   }
+
+  #closeSocket = (): void => {
+    try { this.#sock?.ev?.removeAllListeners?.(); } catch {}
+    try { this.#sock?.ws?.removeAllListeners?.("CB:call"); } catch {}
+    try { this.#sock?.ws?.removeAllListeners?.("CB:receipt"); } catch {}
+    try { this.#sock?.end?.(); } catch {}
+    this.#sock = null;
+  };
+
+  #clearActiveCall = (call: ActiveCall): void => {
+    if (this.#activeCall !== call) return;
+    this.#handleAudioCaptureStop();
+    this.#activeCall = null;
+  };
 
   /** Connect to WhatsApp and bring up the WASM VoIP stack. */
   connect = async (): Promise<void> => {
@@ -189,23 +269,57 @@ export class VoipClient {
     // Connect with auto-reconnect on the post-QR 515 stream-error path.
     await new Promise<void>((resolveOpen, rejectOpen) => {
       let opened = false;
+      let settled = false;
       let retries = 0;
       const maxRetries = 5;
+      let uncaughtHandler: ((err: any) => void) | null = null;
+
+      const cleanupUncaughtHandler = () => {
+        if (uncaughtHandler) {
+          process.off("uncaughtException", uncaughtHandler);
+          uncaughtHandler = null;
+        }
+      };
+
+      const rejectOnce = (err: any) => {
+        if (settled) return;
+        settled = true;
+        cleanupUncaughtHandler();
+        this.#closeSocket();
+        rejectOpen(err);
+      };
+
+      const resolveOnce = () => {
+        if (settled) return;
+        settled = true;
+        cleanupUncaughtHandler();
+        resolveOpen();
+      };
+
+      const scheduleReconnect = (delayMs: number) => {
+        retries += 1;
+        this.#closeSocket();
+        setTimeout(connectSocket, delayMs);
+      };
 
       const connectSocket = () => {
+        if (settled) return;
+        cleanupUncaughtHandler();
+        this.#closeSocket();
         this.#sock = createSocket();
         this.#sock.ev.on("creds.update", saveCreds);
 
-        process.removeAllListeners("uncaughtException");
-        process.on("uncaughtException", (err: any) => {
+        uncaughtHandler = (err: any) => {
           const code = err?.output?.statusCode ?? err?.data?.attrs?.code;
           if ((code === 515 || code === "515") && !opened && retries < maxRetries) {
-            retries += 1;
-            setTimeout(connectSocket, 1500);
+            scheduleReconnect(1500);
           } else if (!opened) {
-            rejectOpen(err);
+            rejectOnce(err);
+          } else {
+            throw err;
           }
-        });
+        };
+        process.on("uncaughtException", uncaughtHandler);
 
         this.#sock.ev.on("connection.update", (update: any) => {
           if (update.qr) {
@@ -218,8 +332,7 @@ export class VoipClient {
           }
           if (update.connection === "open") {
             opened = true;
-            process.removeAllListeners("uncaughtException");
-            resolveOpen();
+            resolveOnce();
             return;
           }
           if (update.connection === "close" && !opened) {
@@ -227,10 +340,9 @@ export class VoipClient {
             const shouldReconnect =
               statusCode === 515 || statusCode === DisconnectReason?.restartRequired;
             if (shouldReconnect && retries < maxRetries) {
-              retries += 1;
-              setTimeout(connectSocket, 1000);
+              scheduleReconnect(1000);
             } else {
-              rejectOpen(update.lastDisconnect?.error ?? new Error("socket closed before open"));
+              rejectOnce(update.lastDisconnect?.error ?? new Error("socket closed before open"));
             }
           }
         });
@@ -314,6 +426,7 @@ export class VoipClient {
 
     const call = new ActiveCall(callId, this.#engine, durationMs);
     call._audioSource = audioSource;
+    call.once("ended", () => this.#clearActiveCall(call));
     this.#activeCall = call;
 
     this.#engine.startCall({
@@ -334,9 +447,10 @@ export class VoipClient {
   disconnect = (): void => {
     this.#activeCall?._forceEnd("disconnect");
     this.#activeCall = null;
+    this.#handleAudioCaptureStop();
     this.#relay?.closeAll();
     this.#engine?.destroy();
-    this.#sock?.end?.();
+    this.#closeSocket();
     this.#engine = null;
     this.#relay = null;
     this.#signaling = null;

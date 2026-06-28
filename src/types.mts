@@ -35,8 +35,18 @@ export type CallEvents = {
 
 /** Top-level SDK configuration. */
 export type VoipSdkConfig = {
-  /** Path to a Baileys multi-file auth state directory. */
-  authDir: string;
+  /**
+   * Path to a Baileys multi-file auth state directory.
+   *
+   * When omitted, the client checks `BAILEYS_AUTH_DIR`, `BAILEYS_SESSION_DIR`,
+   * `WHATSAPP_AUTH_DIR`, then common local session folders containing
+   * `creds.json`, and finally falls back to `./auth`.
+   */
+  authDir?: string;
+  /** Alias for `authDir`, useful when reusing an existing bot session folder. */
+  sessionDir?: string;
+  /** Enable common-folder session auto-detection when no auth directory is provided. */
+  autoDetectAuthDir?: boolean;
 };
 
 /** Mirrors the WhatsApp WASM `CallState` enum. */

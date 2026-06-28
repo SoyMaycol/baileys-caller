@@ -17,6 +17,7 @@ export class AudioFeeder {
   #pending = Buffer.alloc(0);
   #queue: Float32Array[] = [];
   #emitTimer: NodeJS.Timeout | null = null;
+  #running = false;
   #nextEmitAtMs = 0;
   #warmupUntilMs = 0;
 
@@ -34,7 +35,8 @@ export class AudioFeeder {
   ) {}
 
   start = (): void => {
-    if (this.#proc) return;
+    if (this.#running) return;
+    this.#running = true;
 
     const chunkSamples = this.framesPerChunk * this.channels;
     const chunkBytes = chunkSamples * Float32Array.BYTES_PER_ELEMENT;
@@ -86,6 +88,7 @@ export class AudioFeeder {
   };
 
   stop = (): void => {
+    this.#running = false;
     if (this.#emitTimer) {
       clearTimeout(this.#emitTimer);
       this.#emitTimer = null;
@@ -108,7 +111,7 @@ export class AudioFeeder {
   };
 
   #scheduleNext = (chunkSamples: number, chunkIntervalMs: number): void => {
-    if (!this.#proc) return;
+    if (!this.#running) return;
     const now = Date.now();
     if (this.#nextEmitAtMs === 0) this.#nextEmitAtMs = now;
     const delayMs = Math.max(0, this.#nextEmitAtMs - now);

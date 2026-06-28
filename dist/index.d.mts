@@ -24,7 +24,7 @@ export declare class ActiveCall extends EventEmitter {
     _audioSource: string;
     constructor(callId: string, engine: WasmEngine, durationMs: number);
     get state(): CallState;
-    end: () => void;
+    end: (reason?: string) => void;
     mute: (muted: boolean) => void;
     waitForEnd: () => Promise<string>;
     /** @internal — called by VoipClient on WASM call-state change */
@@ -37,7 +37,7 @@ export declare class ActiveCall extends EventEmitter {
 /** Top-level client. Connects to WhatsApp and lets you place calls. */
 export declare class VoipClient {
     #private;
-    constructor(config: VoipSdkConfig);
+    constructor(config?: VoipSdkConfig | string);
     /** Connect to WhatsApp and bring up the WASM VoIP stack. */
     connect: () => Promise<void>;
     /** Place an outbound voice call. */
