@@ -21,6 +21,7 @@ export type BaileysSocket = {
 };
 export type SignalingBridgeConfig = {
     sock: BaileysSocket;
+    baileys?: any;
 };
 export declare class SignalingBridge {
     #private;

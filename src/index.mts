@@ -19,7 +19,7 @@ import { WasmEngine } from "./wasm-engine.mjs";
 import { RelayRtcTransport, type RelayListUpdatePayload } from "./relay-transport.mjs";
 import { SignalingBridge } from "./signaling.mjs";
 import { AudioFeeder } from "./audio-feeder.mjs";
-import { CallState, type VoipSdkConfig } from "./types.mjs";
+import { CallState, type CallOptions, type VoipSdkConfig } from "./types.mjs";
 
 export type { VoipSdkConfig, CallOptions, CallEvents, AudioConfig } from "./types.mjs";
 export { CallState } from "./types.mjs";
@@ -207,6 +207,9 @@ export class VoipClient {
   #relay: RelayRtcTransport | null = null;
   #signaling: SignalingBridge | null = null;
   #sock: any = null;
+  #ownsSocket = false;
+  #callNodeHandler: ((node: any) => void) | null = null;
+  #receiptNodeHandler: ((node: any) => void) | null = null;
   #activeCall: ActiveCall | null = null;
   #baileys: any = null;
 
@@ -225,12 +228,27 @@ export class VoipClient {
     };
   }
 
+  #detachSocketListeners = (): void => {
+    if (this.#callNodeHandler) {
+      try { this.#sock?.ws?.off?.("CB:call", this.#callNodeHandler); } catch {}
+      try { this.#sock?.ws?.removeListener?.("CB:call", this.#callNodeHandler); } catch {}
+      this.#callNodeHandler = null;
+    }
+    if (this.#receiptNodeHandler) {
+      try { this.#sock?.ws?.off?.("CB:receipt", this.#receiptNodeHandler); } catch {}
+      try { this.#sock?.ws?.removeListener?.("CB:receipt", this.#receiptNodeHandler); } catch {}
+      this.#receiptNodeHandler = null;
+    }
+  };
+
   #closeSocket = (): void => {
-    try { this.#sock?.ev?.removeAllListeners?.(); } catch {}
-    try { this.#sock?.ws?.removeAllListeners?.("CB:call"); } catch {}
-    try { this.#sock?.ws?.removeAllListeners?.("CB:receipt"); } catch {}
-    try { this.#sock?.end?.(); } catch {}
-    this.#sock = null;
+    this.#detachSocketListeners();
+    if (this.#ownsSocket) {
+      try { this.#sock?.ev?.removeAllListeners?.(); } catch {}
+      try { this.#sock?.end?.(); } catch {}
+      this.#sock = null;
+      this.#ownsSocket = false;
+    }
   };
 
   #clearActiveCall = (call: ActiveCall): void => {
@@ -241,15 +259,21 @@ export class VoipClient {
 
   /** Connect to WhatsApp and bring up the WASM VoIP stack. */
   connect = async (): Promise<void> => {
-    this.#baileys = await loadBaileys();
-    const { useMultiFileAuthState, default: makeWASocket, DisconnectReason } = this.#baileys;
-    const makeSocket: (opts: any) => any =
-      makeWASocket ?? this.#baileys.makeWASocket ?? this.#baileys;
+    this.#baileys = this.#config.baileys ?? await loadBaileys();
 
-    const authDir = resolve(this.#config.authDir);
-    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    if (this.#config.sock) {
+      this.#closeSocket();
+      this.#sock = this.#config.sock;
+      this.#ownsSocket = false;
+    } else {
+      const { useMultiFileAuthState, default: makeWASocket, DisconnectReason } = this.#baileys;
+      const makeSocket: (opts: any) => any =
+        makeWASocket ?? this.#baileys.makeWASocket ?? this.#baileys;
 
-    const silentLogger: any = {
+      const authDir = resolve(this.#config.authDir);
+      const { state, saveCreds } = await useMultiFileAuthState(authDir);
+
+      const silentLogger: any = {
       level: "silent",
       child: () => silentLogger,
       trace: () => {},
@@ -307,6 +331,7 @@ export class VoipClient {
         cleanupUncaughtHandler();
         this.#closeSocket();
         this.#sock = createSocket();
+        this.#ownsSocket = true;
         this.#sock.ev.on("creds.update", saveCreds);
 
         uncaughtHandler = (err: any) => {
@@ -349,9 +374,12 @@ export class VoipClient {
       };
 
       connectSocket();
-    });
+      });
+    }
 
-    this.#signaling = new SignalingBridge({ sock: this.#sock });
+    if (!this.#sock) throw new Error("Baileys socket is not available.");
+
+    this.#signaling = new SignalingBridge({ sock: this.#sock, baileys: this.#baileys });
     await this.#signaling.init();
 
     this.#relay = new RelayRtcTransport({
@@ -383,19 +411,22 @@ export class VoipClient {
     await this.#engine.waitForVoipStackReady();
     try { this.#engine.updateNetworkMedium(2, 0); } catch {}
 
-    this.#sock.ws.on("CB:call", (node: any) => {
+    this.#detachSocketListeners();
+    this.#callNodeHandler = (node: any) => {
       this.#signaling!.processIncomingCall(node, this.#engine!, this.#activeCall?.callId ?? "");
-    });
-    this.#sock.ws.on("CB:receipt", (node: any) => {
+    };
+    this.#receiptNodeHandler = (node: any) => {
       if (!isCallReceiptNode(node)) return;
       this.#signaling!.processIncomingReceipt(node, this.#engine!, this.#activeCall?.callId ?? "");
-    });
+    };
+    this.#sock.ws.on("CB:call", this.#callNodeHandler);
+    this.#sock.ws.on("CB:receipt", this.#receiptNodeHandler);
   };
 
   /** Place an outbound voice call. */
   call = async (
     phoneNumber: string,
-    opts: { audioSource?: string; durationMs?: number } = {},
+    opts: CallOptions = {},
   ): Promise<ActiveCall> => {
     if (!this.#engine || !this.#signaling) throw new Error("Not connected. Call connect() first.");
     if (this.#activeCall) throw new Error("A call is already active.");

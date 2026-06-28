@@ -12,7 +12,7 @@
  */
 import { EventEmitter } from "node:events";
 import { WasmEngine } from "./wasm-engine.mjs";
-import { CallState, type VoipSdkConfig } from "./types.mjs";
+import { CallState, type CallOptions, type VoipSdkConfig } from "./types.mjs";
 export type { VoipSdkConfig, CallOptions, CallEvents, AudioConfig } from "./types.mjs";
 export { CallState } from "./types.mjs";
 /** A live or recently-ended call. */
@@ -41,10 +41,7 @@ export declare class VoipClient {
     /** Connect to WhatsApp and bring up the WASM VoIP stack. */
     connect: () => Promise<void>;
     /** Place an outbound voice call. */
-    call: (phoneNumber: string, opts?: {
-        audioSource?: string;
-        durationMs?: number;
-    }) => Promise<ActiveCall>;
+    call: (phoneNumber: string, opts?: CallOptions) => Promise<ActiveCall>;
     /** Tear down the WhatsApp socket and release resources. */
     disconnect: () => void;
 }

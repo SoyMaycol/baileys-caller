@@ -14,8 +14,6 @@ export type AudioConfig = {
 
 /** Options for placing a call. */
 export type CallOptions = {
-  /** Phone number, digits only (e.g. `"12345678901"`). */
-  to: string;
   /** Audio source: file path to MP3/WAV, or `"silence"` for an empty uplink. */
   audioSource?: string;
   /** Auto-hangup after N ms (default: 120000). */
@@ -47,6 +45,10 @@ export type VoipSdkConfig = {
   sessionDir?: string;
   /** Enable common-folder session auto-detection when no auth directory is provided. */
   autoDetectAuthDir?: boolean;
+  /** Existing Baileys socket to reuse instead of opening a second WhatsApp connection. */
+  sock?: any;
+  /** Optional already-imported Baileys module for helper functions. */
+  baileys?: any;
 };
 
 /** Mirrors the WhatsApp WASM `CallState` enum. */

@@ -58,13 +58,14 @@ export class SignalingBridge {
     #incomingSignalingQueue = Promise.resolve(undefined);
     constructor(config) {
         this.#sock = config.sock;
+        this.#baileys = config.baileys ?? null;
     }
     /** Hand the WASM engine in so we can dispatch ack callbacks back to it. */
     attachEngine = (voip) => {
         this.#voip = voip;
     };
     init = async () => {
-        this.#baileys = await loadBaileys();
+        this.#baileys ??= await loadBaileys();
         // Hook auth-state writes so we observe TC tokens as they land.
         const originalKeysSet = this.#sock.authState.keys.set.bind(this.#sock.authState.keys);
         this.#sock.authState.keys.set = async (data) => {
