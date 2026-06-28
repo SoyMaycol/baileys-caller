@@ -23,6 +23,7 @@ export type BaileysSocket = {
 
 export type SignalingBridgeConfig = {
   sock: BaileysSocket;
+  baileys?: any;
 };
 
 const S_WHATSAPP_NET = "@s.whatsapp.net";
@@ -86,6 +87,7 @@ export class SignalingBridge {
 
   constructor(config: SignalingBridgeConfig) {
     this.#sock = config.sock;
+    this.#baileys = config.baileys ?? null;
   }
 
   /** Hand the WASM engine in so we can dispatch ack callbacks back to it. */
@@ -94,7 +96,7 @@ export class SignalingBridge {
   };
 
   init = async (): Promise<void> => {
-    this.#baileys = await loadBaileys();
+    this.#baileys ??= await loadBaileys();
 
     // Hook auth-state writes so we observe TC tokens as they land.
     const originalKeysSet = this.#sock.authState.keys.set.bind(this.#sock.authState.keys);

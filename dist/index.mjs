@@ -12,7 +12,8 @@
  */
 import { EventEmitter } from "node:events";
 import { randomBytes, createHmac } from "node:crypto";
-import { resolve } from "node:path";
+import { existsSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { WasmEngine } from "./wasm-engine.mjs";
 import { RelayRtcTransport } from "./relay-transport.mjs";
 import { SignalingBridge } from "./signaling.mjs";
@@ -20,6 +21,16 @@ import { AudioFeeder } from "./audio-feeder.mjs";
 import { CallState } from "./types.mjs";
 export { CallState } from "./types.mjs";
 const SHA256_LEN = 32;
+const DEFAULT_AUTH_DIR = "./auth";
+const AUTH_DIR_ENV_KEYS = ["BAILEYS_AUTH_DIR", "BAILEYS_SESSION_DIR", "WHATSAPP_AUTH_DIR"];
+const AUTH_DIR_CANDIDATES = [
+    DEFAULT_AUTH_DIR,
+    "./session",
+    "./sessions",
+    "./baileys_auth_info",
+    "./auth_info_baileys",
+    "./database/baileys",
+];
 const loadBaileys = async () => {
     try {
         return await import("@whiskeysockets/baileys");
@@ -57,6 +68,50 @@ const computeHmacSha256 = (data, key) => {
     const result = createHmac("sha256", Buffer.from(key)).update(data).digest();
     return new Uint8Array(result.buffer, result.byteOffset, result.byteLength);
 };
+const isExistingBaileysAuthDir = (authDir) => {
+    try {
+        return statSync(authDir).isDirectory() && existsSync(join(authDir, "creds.json"));
+    }
+    catch {
+        return false;
+    }
+};
+const firstConfiguredAuthDir = () => {
+    for (const key of AUTH_DIR_ENV_KEYS) {
+        const value = process.env[key];
+        if (value?.trim())
+            return value;
+    }
+    return undefined;
+};
+const normalizeAuthDir = (config) => {
+    if (typeof config === "string") {
+        if (config.trim().length === 0) {
+            throw new TypeError("VoipClient authDir must be a non-empty string when provided.");
+        }
+        return config;
+    }
+    const { authDir, sessionDir, autoDetectAuthDir = true } = config;
+    if (authDir !== undefined && sessionDir !== undefined && authDir !== sessionDir) {
+        throw new TypeError("VoipClient received both authDir and sessionDir with different values.");
+    }
+    const explicitAuthDir = authDir ?? sessionDir;
+    if (explicitAuthDir !== undefined) {
+        if (typeof explicitAuthDir !== "string" || explicitAuthDir.trim().length === 0) {
+            throw new TypeError("VoipClient authDir must be a non-empty string when provided.");
+        }
+        return explicitAuthDir;
+    }
+    const envAuthDir = firstConfiguredAuthDir();
+    if (envAuthDir)
+        return envAuthDir;
+    if (autoDetectAuthDir) {
+        const detectedAuthDir = AUTH_DIR_CANDIDATES.find(isExistingBaileysAuthDir);
+        if (detectedAuthDir)
+            return detectedAuthDir;
+    }
+    return DEFAULT_AUTH_DIR;
+};
 const isCallReceiptNode = (node) => {
     if (node?.tag !== "receipt")
         return false;
@@ -71,6 +126,7 @@ export class ActiveCall extends EventEmitter {
     #endResolver;
     #endPromise;
     #endTimer = null;
+    #ending = false;
     #ended = false;
     /** @internal mirrors the source path for the audio feeder */
     _audioSource = "silence";
@@ -80,22 +136,21 @@ export class ActiveCall extends EventEmitter {
         this.engine = engine;
         this.#endPromise = new Promise((res) => { this.#endResolver = res; });
         if (durationMs > 0) {
-            this.#endTimer = setTimeout(() => this.end(), durationMs);
+            this.#endTimer = setTimeout(() => this.end("timeout"), durationMs);
         }
     }
     get state() { return this.#state; }
-    end = () => {
+    end = (reason = "hangup") => {
         if (this.#ended)
             return;
-        this.#ended = true;
-        if (this.#endTimer) {
-            clearTimeout(this.#endTimer);
-            this.#endTimer = null;
+        if (!this.#ending) {
+            this.#ending = true;
+            try {
+                this.engine.endCall(0, true);
+            }
+            catch { }
         }
-        try {
-            this.engine.endCall(0, true);
-        }
-        catch { }
+        this._forceEnd(reason);
     };
     mute = (muted) => {
         try {
@@ -122,6 +177,7 @@ export class ActiveCall extends EventEmitter {
         if (this.#ended)
             return;
         this.#ended = true;
+        this.#ending = false;
         if (this.#endTimer) {
             clearTimeout(this.#endTimer);
             this.#endTimer = null;
@@ -137,6 +193,9 @@ export class VoipClient {
     #relay = null;
     #signaling = null;
     #sock = null;
+    #ownsSocket = false;
+    #callNodeHandler = null;
+    #receiptNodeHandler = null;
     #activeCall = null;
     #baileys = null;
     // Capture state populated when WASM negotiates audio params
@@ -146,81 +205,171 @@ export class VoipClient {
     #captureChannels = 1;
     #captureFramesPerChunk = 320;
     #feeder = null;
-    constructor(config) {
-        this.#config = config;
+    constructor(config = {}) {
+        this.#config = {
+            ...(typeof config === "string" ? {} : config),
+            authDir: normalizeAuthDir(config),
+        };
     }
+    #detachSocketListeners = () => {
+        if (this.#callNodeHandler) {
+            try {
+                this.#sock?.ws?.off?.("CB:call", this.#callNodeHandler);
+            }
+            catch { }
+            try {
+                this.#sock?.ws?.removeListener?.("CB:call", this.#callNodeHandler);
+            }
+            catch { }
+            this.#callNodeHandler = null;
+        }
+        if (this.#receiptNodeHandler) {
+            try {
+                this.#sock?.ws?.off?.("CB:receipt", this.#receiptNodeHandler);
+            }
+            catch { }
+            try {
+                this.#sock?.ws?.removeListener?.("CB:receipt", this.#receiptNodeHandler);
+            }
+            catch { }
+            this.#receiptNodeHandler = null;
+        }
+    };
+    #closeSocket = () => {
+        this.#detachSocketListeners();
+        if (this.#ownsSocket) {
+            try {
+                this.#sock?.ev?.removeAllListeners?.();
+            }
+            catch { }
+            try {
+                this.#sock?.end?.();
+            }
+            catch { }
+            this.#sock = null;
+            this.#ownsSocket = false;
+        }
+    };
+    #clearActiveCall = (call) => {
+        if (this.#activeCall !== call)
+            return;
+        this.#handleAudioCaptureStop();
+        this.#activeCall = null;
+    };
     /** Connect to WhatsApp and bring up the WASM VoIP stack. */
     connect = async () => {
-        this.#baileys = await loadBaileys();
-        const { useMultiFileAuthState, default: makeWASocket, DisconnectReason } = this.#baileys;
-        const makeSocket = makeWASocket ?? this.#baileys.makeWASocket ?? this.#baileys;
-        const authDir = resolve(this.#config.authDir);
-        const { state, saveCreds } = await useMultiFileAuthState(authDir);
-        const silentLogger = {
-            level: "silent",
-            child: () => silentLogger,
-            trace: () => { },
-            debug: () => { },
-            info: () => { },
-            warn: () => { },
-            error: () => { },
-            fatal: () => { },
-        };
-        const createSocket = () => makeSocket({
-            auth: state,
-            emitOwnEvents: true,
-            logger: silentLogger,
-        });
-        // Connect with auto-reconnect on the post-QR 515 stream-error path.
-        await new Promise((resolveOpen, rejectOpen) => {
-            let opened = false;
-            let retries = 0;
-            const maxRetries = 5;
-            const connectSocket = () => {
-                this.#sock = createSocket();
-                this.#sock.ev.on("creds.update", saveCreds);
-                process.removeAllListeners("uncaughtException");
-                process.on("uncaughtException", (err) => {
-                    const code = err?.output?.statusCode ?? err?.data?.attrs?.code;
-                    if ((code === 515 || code === "515") && !opened && retries < maxRetries) {
-                        retries += 1;
-                        setTimeout(connectSocket, 1500);
+        this.#baileys = this.#config.baileys ?? await loadBaileys();
+        if (this.#config.sock) {
+            this.#closeSocket();
+            this.#sock = this.#config.sock;
+            this.#ownsSocket = false;
+        }
+        else {
+            const { useMultiFileAuthState, default: makeWASocket, DisconnectReason } = this.#baileys;
+            const makeSocket = makeWASocket ?? this.#baileys.makeWASocket ?? this.#baileys;
+            const authDir = resolve(this.#config.authDir);
+            const { state, saveCreds } = await useMultiFileAuthState(authDir);
+            const silentLogger = {
+                level: "silent",
+                child: () => silentLogger,
+                trace: () => { },
+                debug: () => { },
+                info: () => { },
+                warn: () => { },
+                error: () => { },
+                fatal: () => { },
+            };
+            const createSocket = () => makeSocket({
+                auth: state,
+                emitOwnEvents: true,
+                logger: silentLogger,
+            });
+            // Connect with auto-reconnect on the post-QR 515 stream-error path.
+            await new Promise((resolveOpen, rejectOpen) => {
+                let opened = false;
+                let settled = false;
+                let retries = 0;
+                const maxRetries = 5;
+                let uncaughtHandler = null;
+                const cleanupUncaughtHandler = () => {
+                    if (uncaughtHandler) {
+                        process.off("uncaughtException", uncaughtHandler);
+                        uncaughtHandler = null;
                     }
-                    else if (!opened) {
-                        rejectOpen(err);
-                    }
-                });
-                this.#sock.ev.on("connection.update", (update) => {
-                    if (update.qr) {
-                        void import("qrcode-terminal")
-                            .then((qrt) => (qrt.default ?? qrt).generate(update.qr, { small: true }))
-                            .catch(() => {
-                            console.log("Scan this QR code in WhatsApp > Linked Devices:");
-                            console.log(update.qr);
-                        });
-                    }
-                    if (update.connection === "open") {
-                        opened = true;
-                        process.removeAllListeners("uncaughtException");
-                        resolveOpen();
+                };
+                const rejectOnce = (err) => {
+                    if (settled)
                         return;
-                    }
-                    if (update.connection === "close" && !opened) {
-                        const statusCode = update.lastDisconnect?.error?.output?.statusCode;
-                        const shouldReconnect = statusCode === 515 || statusCode === DisconnectReason?.restartRequired;
-                        if (shouldReconnect && retries < maxRetries) {
-                            retries += 1;
-                            setTimeout(connectSocket, 1000);
+                    settled = true;
+                    cleanupUncaughtHandler();
+                    this.#closeSocket();
+                    rejectOpen(err);
+                };
+                const resolveOnce = () => {
+                    if (settled)
+                        return;
+                    settled = true;
+                    cleanupUncaughtHandler();
+                    resolveOpen();
+                };
+                const scheduleReconnect = (delayMs) => {
+                    retries += 1;
+                    this.#closeSocket();
+                    setTimeout(connectSocket, delayMs);
+                };
+                const connectSocket = () => {
+                    if (settled)
+                        return;
+                    cleanupUncaughtHandler();
+                    this.#closeSocket();
+                    this.#sock = createSocket();
+                    this.#ownsSocket = true;
+                    this.#sock.ev.on("creds.update", saveCreds);
+                    uncaughtHandler = (err) => {
+                        const code = err?.output?.statusCode ?? err?.data?.attrs?.code;
+                        if ((code === 515 || code === "515") && !opened && retries < maxRetries) {
+                            scheduleReconnect(1500);
+                        }
+                        else if (!opened) {
+                            rejectOnce(err);
                         }
                         else {
-                            rejectOpen(update.lastDisconnect?.error ?? new Error("socket closed before open"));
+                            throw err;
                         }
-                    }
-                });
-            };
-            connectSocket();
-        });
-        this.#signaling = new SignalingBridge({ sock: this.#sock });
+                    };
+                    process.on("uncaughtException", uncaughtHandler);
+                    this.#sock.ev.on("connection.update", (update) => {
+                        if (update.qr) {
+                            void import("qrcode-terminal")
+                                .then((qrt) => (qrt.default ?? qrt).generate(update.qr, { small: true }))
+                                .catch(() => {
+                                console.log("Scan this QR code in WhatsApp > Linked Devices:");
+                                console.log(update.qr);
+                            });
+                        }
+                        if (update.connection === "open") {
+                            opened = true;
+                            resolveOnce();
+                            return;
+                        }
+                        if (update.connection === "close" && !opened) {
+                            const statusCode = update.lastDisconnect?.error?.output?.statusCode;
+                            const shouldReconnect = statusCode === 515 || statusCode === DisconnectReason?.restartRequired;
+                            if (shouldReconnect && retries < maxRetries) {
+                                scheduleReconnect(1000);
+                            }
+                            else {
+                                rejectOnce(update.lastDisconnect?.error ?? new Error("socket closed before open"));
+                            }
+                        }
+                    });
+                };
+                connectSocket();
+            });
+        }
+        if (!this.#sock)
+            throw new Error("Baileys socket is not available.");
+        this.#signaling = new SignalingBridge({ sock: this.#sock, baileys: this.#baileys });
         await this.#signaling.init();
         this.#relay = new RelayRtcTransport({
             onTransportMessage: (data, ip, port) => this.#engine?.handleOnTransportMessage(data, ip, port),
@@ -249,14 +398,17 @@ export class VoipClient {
             this.#engine.updateNetworkMedium(2, 0);
         }
         catch { }
-        this.#sock.ws.on("CB:call", (node) => {
+        this.#detachSocketListeners();
+        this.#callNodeHandler = (node) => {
             this.#signaling.processIncomingCall(node, this.#engine, this.#activeCall?.callId ?? "");
-        });
-        this.#sock.ws.on("CB:receipt", (node) => {
+        };
+        this.#receiptNodeHandler = (node) => {
             if (!isCallReceiptNode(node))
                 return;
             this.#signaling.processIncomingReceipt(node, this.#engine, this.#activeCall?.callId ?? "");
-        });
+        };
+        this.#sock.ws.on("CB:call", this.#callNodeHandler);
+        this.#sock.ws.on("CB:receipt", this.#receiptNodeHandler);
     };
     /** Place an outbound voice call. */
     call = async (phoneNumber, opts = {}) => {
@@ -287,6 +439,7 @@ export class VoipClient {
         const callId = ("00" + randomBytes(16).toString("hex").slice(2)).toUpperCase();
         const call = new ActiveCall(callId, this.#engine, durationMs);
         call._audioSource = audioSource;
+        call.once("ended", () => this.#clearActiveCall(call));
         this.#activeCall = call;
         this.#engine.startCall({
             peerJid: peerLid,
@@ -304,9 +457,10 @@ export class VoipClient {
     disconnect = () => {
         this.#activeCall?._forceEnd("disconnect");
         this.#activeCall = null;
+        this.#handleAudioCaptureStop();
         this.#relay?.closeAll();
         this.#engine?.destroy();
-        this.#sock?.end?.();
+        this.#closeSocket();
         this.#engine = null;
         this.#relay = null;
         this.#signaling = null;

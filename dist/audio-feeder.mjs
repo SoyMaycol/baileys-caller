@@ -20,6 +20,7 @@ export class AudioFeeder {
     #pending = Buffer.alloc(0);
     #queue = [];
     #emitTimer = null;
+    #running = false;
     #nextEmitAtMs = 0;
     #warmupUntilMs = 0;
     droppedChunks = 0;
@@ -34,8 +35,9 @@ export class AudioFeeder {
         this.source = source;
     }
     start = () => {
-        if (this.#proc)
+        if (this.#running)
             return;
+        this.#running = true;
         const chunkSamples = this.framesPerChunk * this.channels;
         const chunkBytes = chunkSamples * Float32Array.BYTES_PER_ELEMENT;
         const chunkIntervalMs = (this.framesPerChunk / this.sampleRate) * 1000;
@@ -79,6 +81,7 @@ export class AudioFeeder {
         this.#scheduleNext(chunkSamples, chunkIntervalMs);
     };
     stop = () => {
+        this.#running = false;
         if (this.#emitTimer) {
             clearTimeout(this.#emitTimer);
             this.#emitTimer = null;
@@ -99,7 +102,7 @@ export class AudioFeeder {
         return ["-i", this.source];
     };
     #scheduleNext = (chunkSamples, chunkIntervalMs) => {
-        if (!this.#proc)
+        if (!this.#running)
             return;
         const now = Date.now();
         if (this.#nextEmitAtMs === 0)

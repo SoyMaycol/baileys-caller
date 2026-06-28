@@ -4,16 +4,18 @@
  *
  * Usage: node --experimental-websocket scripts/fetch-wasm-resources.mjs
  */
-import { writeFileSync } from "fs";
+import { mkdirSync, writeFileSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const RESOURCES_DIR = resolve(__dirname, "../src/lib/wasm-resources");
+const RESOURCES_DIR = resolve(__dirname, "../assets/wasm");
 const DEBUGGER_URL = process.env.CALL_CHROME_DEBUGGER_JSON_URL || "http://127.0.0.1:9222/json/list";
 const WASM_ID = process.env.CALL_BROWSER_WASM_ID || "32180";
 
 async function main() {
+  mkdirSync(RESOURCES_DIR, { recursive: true });
+
   // Get page target
   const resp = await fetch(DEBUGGER_URL);
   const targets = await resp.json();

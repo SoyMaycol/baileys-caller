@@ -14,8 +14,6 @@ export type AudioConfig = {
 
 /** Options for placing a call. */
 export type CallOptions = {
-  /** Phone number, digits only (e.g. `"12345678901"`). */
-  to: string;
   /** Audio source: file path to MP3/WAV, or `"silence"` for an empty uplink. */
   audioSource?: string;
   /** Auto-hangup after N ms (default: 120000). */
@@ -35,8 +33,22 @@ export type CallEvents = {
 
 /** Top-level SDK configuration. */
 export type VoipSdkConfig = {
-  /** Path to a Baileys multi-file auth state directory. */
-  authDir: string;
+  /**
+   * Path to a Baileys multi-file auth state directory.
+   *
+   * When omitted, the client checks `BAILEYS_AUTH_DIR`, `BAILEYS_SESSION_DIR`,
+   * `WHATSAPP_AUTH_DIR`, then common local session folders containing
+   * `creds.json`, and finally falls back to `./auth`.
+   */
+  authDir?: string;
+  /** Alias for `authDir`, useful when reusing an existing bot session folder. */
+  sessionDir?: string;
+  /** Enable common-folder session auto-detection when no auth directory is provided. */
+  autoDetectAuthDir?: boolean;
+  /** Existing Baileys socket to reuse instead of opening a second WhatsApp connection. */
+  sock?: any;
+  /** Optional already-imported Baileys module for helper functions. */
+  baileys?: any;
 };
 
 /** Mirrors the WhatsApp WASM `CallState` enum. */
